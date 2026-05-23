@@ -184,6 +184,7 @@ CMD_READ_FILE_START = 0xF2    # VISUAL — shows transfer icon, starts file read
 CMD_READ_FILE_DATA = 0xF3     # VISUAL — file data chunk (part of transfer)
 CMD_READ_FILE_END = 0xF4      # VISUAL — ends file transfer, icon disappears
 CMD_GET_LP_CONFIG = 0x33      # SAFE — 4 bytes
+CMD_GET_FILE_LIST = 0xF1      # SAFE — list device files (BP2A: per-measurement files)
 
 # Device status codes (from Bp2BleInterface.kt)
 STATUS_BP_MEASURING = 0       # RT data type 0 = BP measuring
@@ -560,6 +561,87 @@ def parse_bp_file(payload: bytes) -> list[BpResult]:
     return results
 
 
+def parse_file_list(payload: bytes) -> list[str] | None:
+    """Parse a CMD 0xF1 READ_FILE_LIST response (BP2A format).
+
+    Format (verified on BP2A model 32110002 fw 3.1):
+      [0]    count of files (N, uint8)
+      [1..]  N × 16-byte entries — 14-char ASCII timestamp + 2 NUL pad
+
+    Returns:
+      list[str] — possibly empty — if the response decodes cleanly as the
+        BP2A file-list format (every entry is a 14-digit timestamp string).
+      None — if the response doesn't match (timeout, malformed, or a
+        different device variant). Caller should fall back to the legacy
+        single-file (LP-BP2W) path.
+    """
+    if not payload:
+        return None
+    count = payload[0]
+    if 1 + count * 16 > len(payload):
+        return None
+    names: list[str] = []
+    for i in range(count):
+        start = 1 + i * 16
+        entry = payload[start:start + 16]
+        name = entry.rstrip(b"\x00").decode("ascii", errors="replace")
+        # BP2A names are exactly 14 ASCII digits (YYYYMMDDHHMMSS)
+        if len(name) != 14 or not name.isdigit():
+            return None
+        names.append(name)
+    return names
+
+
+def parse_bp2a_file(payload: bytes) -> BpResult | None:
+    """Parse a single BP2A per-measurement file payload.
+
+    Layout (verified on BP2A model 32110002 fw 3.1, 38-byte file):
+      [0]    record version (0x01)
+      [1]    record type (0x01 = single BP)
+      [2-5]  timestamp uint32 LE (fake-UTC unix seconds, matches filename)
+      [6-10] reserved zeros (no user_id field on BP2A)
+      [11-12] systolic uint16 LE (mmHg)
+      [13-14] diastolic uint16 LE (mmHg)
+      [15-16] MAP uint16 LE (mmHg)
+      [17-18] heart_rate uint16 LE (bpm)
+      [19-37] zero padding
+
+    Returns None on too-short payload or implausible values.
+    """
+    if len(payload) < 19:
+        _LOGGER.debug("BP2A file too short: %d bytes", len(payload))
+        return None
+    try:
+        timestamp = struct.unpack_from("<I", payload, 2)[0]
+        systolic = struct.unpack_from("<H", payload, 11)[0]
+        diastolic = struct.unpack_from("<H", payload, 13)[0]
+        map_val = struct.unpack_from("<H", payload, 15)[0]
+        heart_rate = struct.unpack_from("<H", payload, 17)[0]
+    except (struct.error, IndexError) as e:
+        _LOGGER.warning("Failed to unpack BP2A file: %s", e)
+        return None
+
+    if systolic == 0 or diastolic == 0:
+        return None
+    if not (40 <= systolic <= 300) or not (20 <= diastolic <= 250):
+        _LOGGER.debug("Implausible BP2A BP %d/%d, skipping", systolic, diastolic)
+        return None
+    if not (20 <= heart_rate <= 300):
+        _LOGGER.debug("Implausible BP2A HR %d, skipping", heart_rate)
+        return None
+
+    return BpResult(
+        systolic=systolic,
+        diastolic=diastolic,
+        mean_arterial_pressure=map_val,
+        heart_rate=heart_rate,
+        pulse_pressure=systolic - diastolic,
+        timestamp=timestamp,
+        user_id=0,  # BP2A doesn't track user_id on-device
+        irregular_heartbeat=False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Command builders (Protocol V2)
 # ---------------------------------------------------------------------------
@@ -633,6 +715,19 @@ def build_read_file_data(offset: int) -> bytes:
 def build_read_file_end() -> bytes:
     """Build READ_FILE_END command (CMD 0xF4)."""
     return LepuPacket(cmd=CMD_READ_FILE_END, seq=_next_seq()).encode()
+
+
+def build_get_file_list() -> bytes:
+    """Build GET_FILE_LIST command (CMD 0xF1).
+
+    Returns a zero-payload command. Response format on BP2A:
+      [0]       count of files (N)
+      [1..]     N × 16-byte entries (14-char ASCII timestamp + 2 NUL pad)
+
+    BP2A stores one file per measurement, named YYYYMMDDHHMMSS in the
+    device's local time.
+    """
+    return LepuPacket(cmd=CMD_GET_FILE_LIST, seq=_next_seq()).encode()
 
 
 # ---------------------------------------------------------------------------

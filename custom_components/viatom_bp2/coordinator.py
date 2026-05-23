@@ -89,6 +89,7 @@ from .protocol import (
     CMD_READ_FILE_DATA,
     CMD_READ_FILE_END,
     CMD_GET_LP_CONFIG,
+    CMD_GET_FILE_LIST,
     FILE_BP_LIST,
     DEVICE_STATE_IDLE,
     DEVICE_STATE_MEASURING,
@@ -106,10 +107,13 @@ from .protocol import (
     build_read_file_start,
     build_read_file_data,
     build_read_file_end,
+    build_get_file_list,
     parse_device_info,
     parse_device_info_v1,
     parse_rt_data,
     parse_bp_file,
+    parse_bp2a_file,
+    parse_file_list,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -179,6 +183,9 @@ class ViatomBP2Data:
         self.measurements: list[BpResult] = []
         # Set of (timestamp, systolic, diastolic, map) to track known records
         self._known_keys: set[tuple[int, int, int, int]] = set()
+        # BP2A: set of timestamp filenames already downloaded.
+        # Used to dedup per-measurement files across reconnects.
+        self._known_filenames: set[str] = set()
 
     def update_from_bp_result(self, result: BpResult) -> None:
         """Update from a stored BP file result (newest record)."""
@@ -264,6 +271,35 @@ class ViatomBP2Data:
 
         return new_count
 
+    def ingest_bp2a_record(self, filename: str, record: BpResult) -> bool:
+        """Ingest one BP2A per-file record. Returns True if new.
+
+        BP2A dedup is by filename (one file per measurement on device).
+        We still populate ``_known_keys`` so legacy LP-BP2W dedup logic
+        also recognizes the record if any cross-path interaction occurs.
+        """
+        if filename in self._known_filenames:
+            return False
+        self._known_filenames.add(filename)
+        key = (record.timestamp, record.systolic, record.diastolic,
+               record.mean_arterial_pressure)
+        self._known_keys.add(key)
+        self.measurements.append(record)
+        if len(self.measurements) > MAX_STORED_MEASUREMENTS:
+            self.measurements = self.measurements[-MAX_STORED_MEASUREMENTS:]
+        # Trim known_filenames if it grows too large
+        max_known = MAX_STORED_MEASUREMENTS * 4
+        if len(self._known_filenames) > max_known:
+            # Keep filenames for currently retained measurements only.
+            # (We could keep more but the device file list bounds us anyway.)
+            self._known_filenames = set(
+                list(self._known_filenames)[-max_known:]
+            )
+        # Always update "current" to the newest record after a new ingest
+        newest = max(self.measurements, key=lambda r: r.timestamp)
+        self.update_from_bp_result(newest)
+        return True
+
 
 class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
     """Coordinator for Viatom BP2 BLE data.
@@ -318,6 +354,9 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
         self._fetch_succeeded = False  # persists across connections
         self._last_fetch_new_count: int = 0  # result of last file download
         self._new_data_pending = False  # triggers fast 1s reconnect
+        # BP2A file-list path state
+        self._file_list_result: list[str] | None = None  # populated by 0xF1 handler
+        self._last_file_bytes: bytes = b""  # raw payload from last FILE_END
         # Manual connection control (switch entity)
         self._connection_enabled = True
         # Persistent storage for measurement history
@@ -760,11 +799,139 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
     # File download helper — called by poll loop on RESULT/IDLE
     # ------------------------------------------------------------------
     async def _fetch_bp_data(self, client: BleakClient) -> int:
-        """Download bp2nibp.list and ingest records.
+        """Download BP measurement(s) from device, autodetecting variant.
 
-        Called once per connection by the poll loop (on RESULT or IDLE
-        when _fetch_succeeded is False).  The firmware rejects a second
-        FILE_START on the same connection with byte[3]=0xe1.
+        Strategy:
+          1. Send CMD 0xF1 (READ_FILE_LIST). If the response decodes as the
+             BP2A per-measurement file list, fetch each unseen file.
+          2. Otherwise fall back to the legacy LP-BP2W path that downloads
+             the single aggregate file ``bp2nibp.list``.
+
+        Returns:
+          -1  if FILE_START was rejected and reconnect is needed
+           0  if no new data
+          >0  number of NEW records ingested
+        """
+        files = await self._list_device_files(client)
+        if files is not None:
+            return await self._fetch_bp2a_files(client, files)
+        return await self._fetch_bp_list_file(client)
+
+    async def _list_device_files(
+        self, client: BleakClient
+    ) -> list[str] | None:
+        """Send CMD 0xF1 and return the parsed file list, or None if the
+        device doesn't support the BP2A format (timeout or non-matching
+        response — caller should fall back to the legacy file path).
+        """
+        self._file_list_result = None
+        ok = await self._send_and_wait(
+            client, build_get_file_list(), timeout=3.0
+        )
+        if not ok:
+            _LOGGER.debug(
+                "CMD 0xF1 timeout — using legacy LP-BP2W single-file path"
+            )
+            return None
+        return self._file_list_result
+
+    async def _fetch_bp2a_files(
+        self, client: BleakClient, files: list[str]
+    ) -> int:
+        """Download unseen BP2A per-measurement files and ingest each.
+
+        Returns:
+          -1  if no files were ingested and the first FILE_START failed
+              (caller will reconnect)
+           0  if all files are already known
+          >0  number of new records ingested
+        """
+        new_files = [f for f in files if f not in self._data._known_filenames]
+        if not new_files:
+            _LOGGER.debug(
+                "BP2A: %d files on device, all known — nothing to fetch",
+                len(files),
+            )
+            return 0
+
+        _LOGGER.info(
+            "BP2A: %d files on device, %d new to fetch",
+            len(files), len(new_files),
+        )
+        # Sort newest first so the "current" sensor reflects the most recent
+        # reading first; older backlog files trickle in after.
+        new_files_sorted = sorted(new_files, reverse=True)
+        new_count = 0
+        for fname in new_files_sorted:
+            raw = await self._download_one_file(client, fname)
+            if raw is None:
+                # Most likely the BP2A enforces "one FILE_START per connection"
+                # like its LP-BP2W cousin. Return what we have; the next
+                # reconnect will continue draining the backlog.
+                if new_count == 0:
+                    return -1
+                return new_count
+            record = parse_bp2a_file(raw)
+            if record is None:
+                _LOGGER.warning(
+                    "BP2A: could not parse file %s (%d bytes): %s",
+                    fname, len(raw), raw.hex(),
+                )
+                # Mark the unparseable file as known so we don't loop on it.
+                self._data._known_filenames.add(fname)
+                continue
+            if self._data.ingest_bp2a_record(fname, record):
+                new_count += 1
+                _LOGGER.info(
+                    "BP2A %s: %d/%d mmHg, MAP %d, HR %d bpm (ts=%s)",
+                    fname,
+                    record.systolic, record.diastolic,
+                    record.mean_arterial_pressure, record.heart_rate,
+                    record.timestamp_str,
+                )
+        return new_count
+
+    async def _download_one_file(
+        self, client: BleakClient, filename: str
+    ) -> bytes | None:
+        """Download a single named file via FILE_START / FILE_DATA / FILE_END.
+
+        Returns the raw payload bytes, or None if the device rejected the
+        request (size 0 / 0xE1 error) or the download timed out.
+        """
+        self._file_data_buffer.clear()
+        self._file_size = 0
+        self._last_file_bytes = b""
+        self._all_files_done.clear()
+
+        _LOGGER.debug("Sending FILE_START for %s", filename)
+        await self._write_command(client, build_read_file_start(filename))
+
+        try:
+            await asyncio.wait_for(
+                self._all_files_done.wait(), timeout=FILE_DOWNLOAD_TIMEOUT
+            )
+        except TimeoutError:
+            _LOGGER.warning(
+                "BP2A %s download timed out after %.0fs",
+                filename, FILE_DOWNLOAD_TIMEOUT,
+            )
+            try:
+                await self._write_command(client, build_read_file_end())
+            except BleakError:
+                pass
+            return None
+
+        if not self._last_file_bytes:
+            return None
+        return self._last_file_bytes
+
+    async def _fetch_bp_list_file(self, client: BleakClient) -> int:
+        """Legacy LP-BP2W path: download bp2nibp.list and ingest records.
+
+        Called once per connection when CMD 0xF1 doesn't return a BP2A
+        file list. The firmware rejects a second FILE_START on the same
+        connection with byte[3]=0xe1.
 
         Returns:
           -1  if FILE_START was rejected (0xE1 error, empty payload)
@@ -1025,6 +1192,9 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                         len(self._file_data_buffer),
                     )
             if self._file_data_buffer:
+                # Snapshot raw bytes for BP2A path (caller parses); legacy
+                # LP-BP2W path also runs parse_bp_file below.
+                self._last_file_bytes = bytes(self._file_data_buffer)
                 results = parse_bp_file(bytes(self._file_data_buffer))
                 _LOGGER.info("Parsed %d BP records from file", len(results))
                 if results:
@@ -1051,6 +1221,20 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                     )
                 self._file_data_buffer.clear()
             self._all_files_done.set()
+
+        # READ_FILE_LIST response (CMD 0xF1) — BP2A device file listing
+        elif packet.cmd == CMD_GET_FILE_LIST:
+            self._file_list_result = parse_file_list(packet.payload)
+            if self._file_list_result is None:
+                _LOGGER.debug(
+                    "CMD 0xF1 response not BP2A format (payload=%s)",
+                    packet.payload.hex(),
+                )
+            else:
+                _LOGGER.debug(
+                    "CMD 0xF1: %d files on device",
+                    len(self._file_list_result),
+                )
 
         else:
             _LOGGER.debug(
@@ -1211,13 +1395,14 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
     # Persistent storage — measurement history
     # ------------------------------------------------------------------
     async def async_save_data(self) -> None:
-        """Persist measurements and known_keys to disk."""
+        """Persist measurements, known_keys, and BP2A known_filenames."""
         async with self._save_lock:
             data = {
                 "measurements": [
                     dataclasses.asdict(m) for m in self._data.measurements
                 ],
                 "known_keys": [list(k) for k in self._data._known_keys],
+                "known_filenames": sorted(self._data._known_filenames),
             }
             await self._store.async_save(data)
             _LOGGER.debug(
@@ -1225,7 +1410,7 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
             )
 
     async def async_load_data(self) -> None:
-        """Restore measurements and known_keys from disk."""
+        """Restore measurements, known_keys, and BP2A known_filenames."""
         data = await self._store.async_load()
         if not data:
             return
@@ -1239,13 +1424,17 @@ class ViatomBP2Coordinator(DataUpdateCoordinator[ViatomBP2Data]):
                 self._data._known_keys.add(tuple(key))
             except (TypeError, ValueError) as exc:
                 _LOGGER.warning("Skipping corrupt known_key: %s", exc)
+        for fname in data.get("known_filenames", []):
+            if isinstance(fname, str):
+                self._data._known_filenames.add(fname)
         if self._data.measurements:
             newest = max(self._data.measurements, key=lambda r: r.timestamp)
             self._data.update_from_bp_result(newest)
             self._fetch_succeeded = True
         _LOGGER.info(
-            "Restored %d measurements from storage",
+            "Restored %d measurements (%d BP2A filenames known) from storage",
             len(self._data.measurements),
+            len(self._data._known_filenames),
         )
         self.async_set_updated_data(self._data)
 
